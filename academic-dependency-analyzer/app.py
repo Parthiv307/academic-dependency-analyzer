@@ -1,0 +1,328 @@
+"""
+Student Academic Dependency Analyzer  (Linear Algebra mini-project)
+Pipeline: Academic data -> Matrix -> Rank -> Dependence/Independence
+          -> Gram-Schmidt -> Projection -> Performance representation
+
+Run:  pip install flask numpy
+      python app.py        then open http://127.0.0.1:5000
+"""
+import numpy as np
+from flask import Flask, jsonify, request, Response
+
+app = Flask(__name__)
+
+
+# ---------------------------------------------------------------- maths ----
+def parse_csv(text):
+    """CSV text -> (student names, component names, matrix A [n x m])."""
+    rows = [[c.strip() for c in ln.split(",")] for ln in text.strip().splitlines() if ln.strip()]
+    if len(rows) < 3:
+        raise ValueError("Provide a header row and at least 2 student rows.")
+    header, body = rows[0], rows[1:]
+
+    def is_num(s):
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+    has_names = not is_num(body[0][0])
+    comps = header[1:] if has_names else header
+    names = [r[0] for r in body] if has_names else [f"S{i+1}" for i in range(len(body))]
+    try:
+        data = [[float(x) for x in (r[1:] if has_names else r)] for r in body]
+    except ValueError:
+        raise ValueError("All marks must be numbers.")
+    if any(len(r) != len(comps) for r in data):
+        raise ValueError("Every row must have the same number of columns as the header.")
+    if not 5 <= len(comps) <= 8:
+        raise ValueError(f"Use 5 to 8 academic components (you gave {len(comps)}).")
+    return names, comps, np.array(data)
+
+
+def rref(A, tol):
+    """Gauss-Jordan elimination with partial pivoting -> (RREF, pivot columns)."""
+    M, (n, m) = A.astype(float).copy(), A.shape
+    pivots, r = [], 0
+    for c in range(m):
+        if r >= n:
+            break
+        p = r + int(np.argmax(np.abs(M[r:, c])))
+        if abs(M[p, c]) < tol:
+            M[r:, c] = 0
+            continue
+        M[[r, p]] = M[[p, r]]
+        M[r] /= M[r, c]
+        for i in range(n):
+            if i != r:
+                M[i] -= M[i, c] * M[r]
+        pivots.append(c)
+        r += 1
+    return M, pivots
+
+
+def gram_schmidt(V, tol=1e-9):
+    """Classical Gram-Schmidt on the columns of V. Returns Q (orthonormal), norms."""
+    Q, norms = [], []
+    for k in range(V.shape[1]):
+        u = V[:, k].copy()
+        for q in Q:
+            u -= (q @ V[:, k]) * q
+        nu = np.linalg.norm(u)
+        norms.append(nu)
+        Q.append(u / nu if nu > tol else u * 0)
+    return np.array(Q).T, norms
+
+
+def analyze(text, tol_rel):
+    names, comps, A = parse_csv(text)
+    n, m = A.shape
+    tol = tol_rel * max(np.abs(A).max(), 1)
+
+    R_ref, piv = rref(A, tol)                       # Stage 2: rank
+    rank = len(piv)
+    dep = [j for j in range(m) if j not in piv]     # Stage 3: dependence
+    Aind = A[:, piv]
+    relations = []
+    for j in dep:
+        x, *_ = np.linalg.lstsq(Aind, A[:, j], rcond=None)
+        res = float(np.linalg.norm(Aind @ x - A[:, j]))
+        terms = [{"c": round(float(c), 4), "name": comps[piv[i]]}
+                 for i, c in enumerate(x) if abs(c) > 1e-6]
+        relations.append({"name": comps[j], "terms": terms, "residual": res})
+
+    Q, gs_norms = gram_schmidt(Aind)                # Stage 4: orthogonal basis
+    Rm = Q.T @ A                                    # coordinates of every component
+
+    b = A.mean(axis=1)                              # overall performance vector
+    coef = Q.T @ b                                  # Stage 5: projection
+    proj = Q @ coef
+    share = (coef ** 2 / (b @ b)).tolist()
+
+    checks = {
+        "orth_err": float(np.linalg.norm(Q.T @ Q - np.eye(rank))),
+        "recon_err": float(np.linalg.norm(Q @ Rm - A)),
+        "np_rank": int(np.linalg.matrix_rank(A, tol=tol)),
+        "proj_resid": float(np.linalg.norm(b - proj)),
+        "proj_orth": float(np.abs(Q.T @ (b - proj)).max()),
+    }
+    # plain-language interpretation
+    notes = [f"{rank} of {m} components are linearly independent, so the marks carry "
+             f"{rank} genuinely different performance directions."]
+    if dep:
+        for r in relations:
+            expr = " + ".join(f"{t['c']:.2f}×{t['name']}" for t in r["terms"])
+            notes.append(f"{r['name']} is redundant: it equals {expr}. It adds no new information.")
+    else:
+        notes.append("No component is an exact combination of the others.")
+    top = int(np.argmax(share))
+    notes.append(f"Direction {top+1} (starting from {comps[piv[top]]}) explains "
+                 f"{share[top]*100:.1f}% of overall performance.")
+    notes.append(f"{sum(share)*100:.1f}% of the overall performance vector lies inside the "
+                 f"span of the independent components.")
+    if n < m:
+        notes.append("There are fewer students than components, so dependence is forced. Add more students.")
+
+    f = lambda a: np.round(a, 4).tolist()
+    return dict(names=names, comps=comps, A=f(A), rank=rank, pivots=piv, dep=dep,
+                rref=f(R_ref), relations=relations, Q=f(Q), gs_norms=f(np.array(gs_norms)),
+                R=f(Rm), overall=f(b), proj=f(proj), coef=f(coef), share=f(np.array(share)),
+                checks=checks, notes=notes, n=n, m=m)
+
+
+@app.post("/api/analyze")
+def api():
+    body = request.get_json(force=True)
+    try:
+        return jsonify(analyze(body.get("csv", ""), float(body.get("tol", 1e-8))))
+    except Exception as e:  # show friendly error in the UI
+        return jsonify(error=str(e)), 400
+
+
+@app.get("/")
+def index():
+    return Response(PAGE, mimetype="text/html")
+
+
+# ------------------------------------------------------------------ UI -----
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Academic Dependency Analyzer</title>
+<style>
+:root{--paper:#eef2f1;--ink:#12302f;--mute:#5b7170;--line:#c7d4d2;--card:#fbfdfc;--acc:#0d7c78;--hot:#c2410c;--ok:#15803d;--grid:#dfe8e6}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);font:16px/1.55 "Segoe UI",system-ui,sans-serif;background:var(--paper);
+background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:28px 28px}
+h1,h2,h3{font-family:Georgia,"Times New Roman",serif;margin:0;letter-spacing:-.01em}
+header{padding:44px 20px 24px;max-width:1100px;margin:auto}
+h1{font-size:clamp(2rem,5vw,3.2rem);line-height:1.1}
+header p{max-width:62ch;color:var(--mute);margin:12px 0 0}
+main{max-width:1100px;margin:auto;padding:0 20px 80px;display:grid;gap:22px;grid-template-columns:minmax(0,1fr)}
+.card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:22px}
+.card h2{font-size:1.35rem;margin-bottom:4px}.sub{color:var(--mute);margin:0 0 14px;font-size:.92rem}
+.pipe{display:flex;flex-wrap:wrap;gap:6px;padding:0;list-style:none;margin:0}
+.pipe li{padding:5px 11px;border:1px solid var(--line);border-radius:99px;background:#fff;font-size:.85rem}
+.pipe li.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+textarea{width:100%;min-height:210px;font:14px/1.5 ui-monospace,Consolas,monospace;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);resize:vertical}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}
+button,.btn{font:inherit;padding:9px 16px;border-radius:8px;border:1px solid var(--ink);background:#fff;color:var(--ink);cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button:hover{filter:brightness(.95)}button:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}
+select,input[type=file]{font:inherit}label{font-size:.9rem;color:var(--mute)}
+.err{color:var(--hot);font-weight:600;margin-top:10px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;font-size:.88rem;font-variant-numeric:tabular-nums;min-width:100%}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}th{font-weight:600;background:#f1f6f5}
+td.dep,th.dep{color:var(--hot)}td.piv,th.piv{color:var(--acc)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{border:1px solid var(--line);border-radius:8px;padding:12px;background:#fff}
+.stat b{display:block;font:700 2rem/1.1 Georgia,serif}.stat span{color:var(--mute);font-size:.85rem}
+.tags{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
+.tag{padding:3px 10px;border-radius:6px;font-size:.88rem;border:1px solid}
+.tag.i{color:var(--acc);border-color:var(--acc);background:#e6f4f3}.tag.d{color:var(--hot);border-color:var(--hot);background:#fdeee6}
+.rel{padding:10px 14px;border-left:4px solid var(--hot);background:#fdf3ec;border-radius:0 8px 8px 0;margin:8px 0}
+.bars .b{display:grid;grid-template-columns:130px 1fr 64px;gap:10px;align-items:center;margin:6px 0;font-size:.9rem}
+.bars .t{height:16px;background:#e3ecea;border-radius:4px;overflow:hidden}.bars .f{height:100%;background:var(--acc)}
+.chk{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:.92rem}
+.pass{color:var(--ok);font-weight:700}.fail{color:var(--hot);font-weight:700}
+.notes li{margin:6px 0}code{background:#e6eeed;padding:1px 6px;border-radius:4px}
+.math{font-family:Georgia,serif;background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:10px 0;overflow-x:auto}
+details summary{cursor:pointer;font-weight:600}
+.mxwrap{padding:6px 0}
+.mx{display:block;border-left:4px solid var(--ink);border-right:4px solid var(--ink);border-radius:14px;padding:10px 12px;background:#fff}
+.mx table{border-collapse:separate;border-spacing:4px;min-width:0}
+.mx th,.mx td{padding:0;border:0;background:none;text-align:center}
+.mx input{width:104px;font:15px ui-monospace,Consolas,monospace;padding:8px 6px;text-align:center;border:1px solid var(--line);border-radius:6px;background:#fbfdfc;color:var(--ink)}
+.mx input.nm{width:96px;text-align:left;font-family:inherit}
+.mx input.hd{width:112px;font-size:13px;font-weight:700;font-family:Georgia,serif;background:#e6f4f3;border-color:#9fcfcb}
+.mx input.bad{border-color:var(--hot);background:#fdeee6}
+.mx .x{padding:2px 8px;border:0;color:var(--hot);background:none;font-size:1.1rem}
+details textarea{margin-top:10px;min-height:120px}
+#out{display:none;gap:22px}
+@media(max-width:600px){.bars .b{grid-template-columns:90px 1fr 56px}}
+</style></head><body>
+<header>
+<h1>Student Academic Dependency Analyzer</h1>
+<p>Paste marks for 5 to 8 academic components. The analyzer finds which components repeat each other, keeps the independent ones, and rebuilds them as perpendicular performance directions.</p>
+<ul class="pipe" style="margin-top:16px"><li>Data</li><li>Matrix</li><li>Rank</li><li>Dependence</li><li>Gram-Schmidt</li><li>Projection</li><li>Representation</li></ul>
+</header>
+<main>
+<section class="card">
+<h2>Input marks matrix</h2>
+<p class="sub">Type marks straight into the grid, or paste a block copied from Excel into any cell. Rows are students, columns are components (5 to 8).</p>
+<div class="mxwrap"><div class="mx scroll" id="grid"></div></div>
+<div class="row">
+<button id="addRow">+ Student</button>
+<button id="addCol">+ Component</button>
+<button id="sample">Load sample</button>
+<button id="clear">Clear marks</button>
+</div>
+<div class="row"><button class="primary" id="go">Analyze marks</button>
+<label>Tolerance <select id="tol"><option value="1e-10">1e-10</option><option value="1e-8" selected>1e-8</option><option value="1e-6">1e-6</option><option value="1e-4">1e-4</option></select></label></div>
+<details style="margin-top:14px"><summary>Import from CSV</summary>
+<textarea id="csv" spellcheck="false" aria-label="Marks as CSV" placeholder="Student,Maths,Physics,..."></textarea>
+<div class="row"><button id="imp">Fill grid from CSV</button><label>or upload <input type="file" id="file" accept=".csv,text/csv"></label></div></details>
+<div class="err" id="err" role="alert"></div>
+</section>
+
+<div id="out" style="display:none;gap:22px;grid-template-columns:minmax(0,1fr)">
+<section class="card"><h2>Summary</h2><div class="stats" id="stats"></div><ul class="notes" id="notes"></ul></section>
+<section class="card"><h2>1. Feature matrix A</h2><p class="sub">Rows are students, columns are components. Each column is a vector in R<sup id="nn"></sup>.</p><div class="scroll" id="tA"></div></section>
+<section class="card"><h2>2. Rank and elimination</h2><p class="sub">Gauss-Jordan elimination reduces A. Pivot columns (teal) are independent. Others (orange) are dependent.</p><div class="scroll" id="tR"></div></section>
+<section class="card"><h2>3. Dependent and independent factors</h2><div class="tags" id="tags"></div><div id="rels"></div></section>
+<section class="card"><h2>4. Orthogonal basis (Gram-Schmidt)</h2>
+<div class="math">u<sub>k</sub> = v<sub>k</sub> &minus; &Sigma;<sub>j&lt;k</sub> (q<sub>j</sub>&middot;v<sub>k</sub>) q<sub>j</sub> &nbsp;&nbsp; q<sub>k</sub> = u<sub>k</sub> / &Vert;u<sub>k</sub>&Vert;</div>
+<div class="scroll" id="tQ"></div>
+<h3 style="margin:18px 0 6px;font-size:1.05rem">Coordinates of each component in the new basis (R = QᵀA)</h3><div class="scroll" id="tCo"></div></section>
+<section class="card"><h2>5. Projection of overall performance</h2><p class="sub">The overall vector b is each student's mean mark. Its projection on direction q<sub>k</sub> is (q<sub>k</sub>&middot;b) q<sub>k</sub>.</p><div class="bars" id="bars"></div><div class="scroll" id="tP" style="margin-top:14px"></div></section>
+<section class="card"><h2>6. Verification</h2><div id="chk"></div></section>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const SAMPLE=`Student,Maths,Physics,Programming,English,Lab,Assignment,Internal Total
+S1,78,72,85,70,18,16,34
+S2,65,60,70,75,15,14,29
+S3,92,88,90,80,19,18,37
+S4,55,50,62,68,12,11,23
+S5,81,79,74,72,16,17,33
+S6,70,66,88,60,17,13,30
+S7,88,91,79,85,18,19,37
+S8,60,58,55,77,13,12,25
+S9,95,93,96,90,20,19,39
+S10,73,70,67,64,14,15,29`;
+let G={comps:[],names:[],data:[]};
+function fromCSV(t){
+ const rows=t.trim().split(/\r?\n/).filter(l=>l.trim()).map(l=>l.split(/,|\t/).map(c=>c.trim()));
+ if(rows.length<2)return false;
+ const named=isNaN(parseFloat(rows[1][0]));
+ G.comps=named?rows[0].slice(1):rows[0].slice();
+ G.names=rows.slice(1).map((r,i)=>named?r[0]:"S"+(i+1));
+ G.data=rows.slice(1).map(r=>(named?r.slice(1):r).slice(0,G.comps.length));
+ return true;
+}
+function toCSV(){return ["Student,"+G.comps.join(",")].concat(G.data.map((r,i)=>G.names[i]+","+r.join(","))).join("\n")}
+function draw(){
+ let h=`<table><thead><tr><th></th>${G.comps.map((c,j)=>`<th><input class="hd" data-h="${j}" value="${c}" aria-label="Component ${j+1} name">${G.comps.length>5?`<br><button class="x" data-dc="${j}" title="Remove component">×</button>`:""}</th>`).join("")}<th></th></tr></thead><tbody>`;
+ G.data.forEach((r,i)=>{h+=`<tr><td><input class="nm" data-n="${i}" value="${G.names[i]}" aria-label="Student ${i+1} name"></td>${G.comps.map((_,j)=>`<td><input data-i="${i}" data-j="${j}" inputmode="decimal" value="${r[j]??""}"></td>`).join("")}<td>${G.data.length>2?`<button class="x" data-dr="${i}" title="Remove student">×</button>`:""}</td></tr>`});
+ $("grid").innerHTML=h+"</tbody></table>";
+ $("addCol").disabled=G.comps.length>=8;
+}
+$("grid").addEventListener("input",e=>{const t=e.target;
+ if(t.dataset.h!==undefined)G.comps[t.dataset.h]=t.value;
+ else if(t.dataset.n!==undefined)G.names[t.dataset.n]=t.value;
+ else if(t.dataset.i!==undefined){G.data[t.dataset.i][t.dataset.j]=t.value;t.classList.toggle("bad",t.value.trim()===""||isNaN(Number(t.value)))}});
+$("grid").addEventListener("click",e=>{const d=e.target.dataset;
+ if(d.dc!==undefined){G.comps.splice(d.dc,1);G.data.forEach(r=>r.splice(d.dc,1));draw()}
+ if(d.dr!==undefined){G.names.splice(d.dr,1);G.data.splice(d.dr,1);draw()}});
+$("grid").addEventListener("keydown",e=>{const t=e.target;if(e.key!=="Enter"||t.dataset.i===undefined)return;
+ e.preventDefault();const n=$("grid").querySelector(`[data-i="${+t.dataset.i+1}"][data-j="${t.dataset.j}"]`);if(n){n.focus();n.select()}});
+$("grid").addEventListener("paste",e=>{const t=e.target,txt=(e.clipboardData||window.clipboardData).getData("text");
+ if(t.dataset.i===undefined||!/[\t\n]/.test(txt))return;e.preventDefault();
+ const rows=txt.trim().split(/\r?\n/).map(l=>l.split("\t"));let i0=+t.dataset.i,j0=+t.dataset.j;
+ rows.forEach((r,a)=>{if(i0+a>=G.data.length){G.names.push("S"+(G.data.length+1));G.data.push(G.comps.map(()=>""))}
+  r.forEach((v,b)=>{if(j0+b<G.comps.length)G.data[i0+a][j0+b]=v.trim()})});draw()});
+$("addRow").onclick=()=>{G.names.push("S"+(G.data.length+1));G.data.push(G.comps.map(()=>""));draw()};
+$("addCol").onclick=()=>{G.comps.push("Comp"+(G.comps.length+1));G.data.forEach(r=>r.push(""));draw()};
+$("clear").onclick=()=>{G.data=G.data.map(r=>r.map(()=>""));draw()};
+$("sample").onclick=()=>{fromCSV(SAMPLE);draw();run()};
+$("imp").onclick=()=>{if(fromCSV($("csv").value)){draw();$("err").textContent=""}else $("err").textContent="Paste a header row and at least 2 student rows."};
+$("file").onchange=e=>{const r=new FileReader();r.onload=()=>{$("csv").value=r.result;if(fromCSV(r.result))draw()};r.readAsText(e.target.files[0])};
+$("go").onclick=run;
+fromCSV(SAMPLE);draw();
+const f=(x,d=3)=>Number(x).toFixed(d);
+function table(head,rows,cls=[]){return `<table><thead><tr>${head.map((h,i)=>`<th class="${cls[i]||""}">${h}</th>`).join("")}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${cls[i]||""}">${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`}
+async function run(){
+ $("err").textContent="";
+ const res=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({csv:toCSV(),tol:$("tol").value})});
+ const d=await res.json();
+ if(!res.ok){$("err").textContent=d.error;return}
+ const cls=d.comps.map((_,j)=>d.pivots.includes(j)?"piv":"dep");
+ const ind=d.pivots.map(j=>d.comps[j]);
+ $("out").style.display="grid";
+ $("nn").textContent=d.n;
+ $("stats").innerHTML=[[d.n+" × "+d.m,"matrix size"],[d.rank,"rank"],[d.rank,"independent factors"],[d.m-d.rank,"dependent factors"]].map(s=>`<div class="stat"><b>${s[0]}</b><span>${s[1]}</span></div>`).join("");
+ $("notes").innerHTML=d.notes.map(n=>`<li>${n}</li>`).join("");
+ $("tA").innerHTML=table(["Student",...d.comps],d.A.map((r,i)=>[d.names[i],...r.map(x=>f(x,1))]),["",...cls]);
+ $("tR").innerHTML=table(["Row",...d.comps],d.rref.map((r,i)=>[i+1,...r.map(x=>f(x,2))]),["",...cls]);
+ $("tags").innerHTML=d.comps.map((c,j)=>`<span class="tag ${d.pivots.includes(j)?"i":"d"}">${c}: ${d.pivots.includes(j)?"independent":"dependent"}</span>`).join("");
+ $("rels").innerHTML=d.relations.length?d.relations.map(r=>`<div class="rel"><b>${r.name}</b> = ${r.terms.map(t=>`${f(t.c,2)}·${t.name}`).join(" + ")}<br><small>residual ${r.residual.toExponential(1)}</small></div>`).join(""):"<p>No dependencies found. All components are independent.</p>";
+ const qn=ind.map((_,k)=>`q<sub>${k+1}</sub>`);
+ $("tQ").innerHTML=table(["Student",...qn],d.Q.map((r,i)=>[d.names[i],...r.map(x=>f(x))]));
+ $("tCo").innerHTML=table(["Direction",...d.comps],d.R.map((r,k)=>[`q<sub>${k+1}</sub> (${ind[k]})`,...r.map(x=>f(x,2))]),["",...cls]);
+ $("bars").innerHTML=d.share.map((s,k)=>`<div class="b"><span>q<sub>${k+1}</sub> · ${ind[k]}</span><div class="t"><div class="f" style="width:${Math.min(100,s*100)}%"></div></div><span>${f(s*100,1)}%</span></div>`).join("");
+ $("tP").innerHTML=table(["Student","Overall b","Projection","Residual"],d.names.map((n,i)=>[n,f(d.overall[i],2),f(d.proj[i],2),f(d.overall[i]-d.proj[i],4)]));
+ const c=d.checks,T=1e-6,row=(l,v,ok)=>`<div class="chk"><span>${l}</span><span class="${ok?"pass":"fail"}">${v} ${ok?"✓":"✗"}</span></div>`;
+ $("chk").innerHTML=row("Own rank equals NumPy rank",`${d.rank} = ${c.np_rank}`,d.rank===c.np_rank)+
+  row("Orthonormality ‖QᵀQ − I‖",c.orth_err.toExponential(1),c.orth_err<T)+
+  row("Reconstruction ‖QR − A‖",c.recon_err.toExponential(1),c.recon_err<1e-4)+
+  row("Residual b − proj is perpendicular to basis",c.proj_orth.toExponential(1),c.proj_orth<T);
+ $("out").scrollIntoView({behavior:"smooth"});
+}
+run();
+</script></body></html>"""
+
+if __name__ == "__main__":
+    app.run(debug=True)
